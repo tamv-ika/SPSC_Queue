@@ -25,67 +25,84 @@ SOFTWARE.
 #pragma once
 #include <atomic>
 
-template<class T, uint32_t CNT>
+template <class T, uint32_t CNT>
 class SPSCQueue
 {
 public:
-    static_assert(CNT && !(CNT & (CNT - 1)), "CNT must be a power of 2");
+  static_assert(CNT && !(CNT & (CNT - 1)), "CNT must be a power of 2");
 
-    T* alloc() {
-      if (write_idx - read_idx_cach == CNT) {
-        read_idx_cach = ((std::atomic<uint32_t>*)&read_idx)->load(std::memory_order_consume);
-        if (__builtin_expect(write_idx - read_idx_cach == CNT, 0)) { // no enough space
-          return nullptr;
-        }
+  T *alloc()
+  {
+    if (write_idx - read_idx_cach == CNT)
+    {
+      read_idx_cach = ((std::atomic<uint32_t> *)&read_idx)->load(std::memory_order_consume);
+      if (__builtin_expect(write_idx - read_idx_cach == CNT, 0))
+      { // no enough space
+        return nullptr;
       }
-      return &data[write_idx % CNT];
     }
+    return &data[write_idx & mask];
+  }
 
-    void push() {
-      ((std::atomic<uint32_t>*)&write_idx)->store(write_idx + 1, std::memory_order_release);
+  void push()
+  {
+    ((std::atomic<uint32_t> *)&write_idx)->store(write_idx + 1, std::memory_order_release);
+  }
+
+  template <typename Writer>
+  bool tryPush(Writer writer)
+  {
+    T *p = alloc();
+    if (!p)
+      return false;
+    writer(p);
+    push();
+    return true;
+  }
+
+  template <typename Writer>
+  void blockPush(Writer writer)
+  {
+    while (!tryPush(writer))
+      ;
+  }
+
+  T *front()
+  {
+    if (read_idx == write_idx_cach)
+    {
+      write_idx_cach = ((std::atomic<uint32_t> *)&write_idx)->load(std::memory_order_acquire);
+      if (read_idx == write_idx_cach)
+      {
+        return nullptr;
+      }
     }
+    return &data[read_idx & mask];
+  }
 
-    template<typename Writer>
-    bool tryPush(Writer writer) {
-      T* p = alloc();
-      if (!p) return false;
-      writer(p);
-      push();
-      return true;
-    }
+  void pop()
+  {
+    ((std::atomic<uint32_t> *)&read_idx)->store(read_idx + 1, std::memory_order_release);
+  }
 
-    template<typename Writer>
-    void blockPush(Writer writer) {
-      while (!tryPush(writer))
-        ;
-    }
+  template <typename Reader>
+  bool tryPop(Reader reader)
+  {
+    T *v = front();
+    if (!v)
+      return false;
+    reader(v);
+    pop();
+    return true;
+  }
 
-    T* front() {
-        if (read_idx == ((std::atomic<uint32_t>*)&write_idx)->load(std::memory_order_acquire)) {
-          return nullptr;
-        }
-        return &data[read_idx % CNT];
-    }
+private:
+  alignas(128) T data[CNT] = {};
 
-    void pop() {
-      ((std::atomic<uint32_t>*)&read_idx)->store(read_idx + 1, std::memory_order_release);
-    }
+  alignas(128) uint32_t write_idx = 0;
+  uint32_t read_idx_cach = 0; // used only by writing thread
 
-    template<typename Reader>
-    bool tryPop(Reader reader) {
-      T* v = front();
-      if (!v) return false;
-      reader(v);
-      pop();
-      return true;
-    }
-
-  private:
-    alignas(128) T data[CNT] = {};
-
-    alignas(128) uint32_t write_idx = 0;
-    uint32_t read_idx_cach = 0; // used only by writing thread
-
-    alignas(128) uint32_t read_idx = 0;
+  alignas(128) uint32_t read_idx = 0;
+  uint32_t write_idx_cach = 0; // used only by reading thread
+  uint32_t mask = CNT - 1;
 };
-

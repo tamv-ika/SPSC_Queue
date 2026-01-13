@@ -11,108 +11,131 @@ struct Msg
   long val[4];
 };
 
-// typedef SPSCQueue<Msg, 64> MsgQ;
-typedef SPSCQueueOPT<Msg, 64> MsgQ;
+// typedef SPSCQueue<Msg, 1 << 10> MsgQ;
+typedef SPSCQueueOPT<Msg, 1 << 10> MsgQ;
 
-const int loop = 1000000;
+const int loop = 50000000;
 const int sleep_cycles = 1000;
 uint64_t alloc_lat = 0;
 uint64_t push_lat = 0;
 MsgQ _q;
 
-void sendthread() {
-  if (!cpupin(6)) {
+void sendthread()
+{
+  if (!cpupin(6))
+  {
     exit(1);
   }
 
-    MsgQ* q = &_q;
+  MsgQ *q = &_q;
 
-    int g_val = 0;
-    srand(time(NULL));
-    while(g_val < loop) {
-      auto t1 = rdtscp();
-      Msg* msg = q->alloc();
-      auto t2 = rdtscp();
-      if (!msg) continue;
+  int g_val = 0;
+  srand(time(NULL));
+  while (g_val < loop)
+  {
+    auto t1 = rdtscp();
+    Msg *msg = q->alloc();
+    auto t2 = rdtscp();
+    if (!msg)
+      continue;
+    int val_len = rand() % 4 + 1;
+    msg->val_len = val_len;
+    // for (int i = 0; i < val_len; i++) msg->val[i] = ++g_val;
+    auto t3 = rdtscp();
+    msg->ts = t3;
+    q->push();
+    auto t4 = rdtscp();
+    g_val++;
+    /*
+    q->tryPush([&](Msg* msg) {
       int val_len = rand() % 4 + 1;
       msg->val_len = val_len;
       for (int i = 0; i < val_len; i++) msg->val[i] = ++g_val;
-      auto t3 = rdtscp();
-      msg->ts = t3;
-      q->push();
-      auto t4 = rdtscp();
-      /*
-      q->tryPush([&](Msg* msg) {
-        int val_len = rand() % 4 + 1;
-        msg->val_len = val_len;
-        for (int i = 0; i < val_len; i++) msg->val[i] = ++g_val;
-        msg->ts = rdtscp();
-      });
-      */
-      alloc_lat += t2 - t1;
-      push_lat += t4 - t3;
-      auto expire = rdtsc() + sleep_cycles;
-      while (rdtsc() < expire)
-        ;
-    }
+      msg->ts = rdtscp();
+    });
+    */
+    alloc_lat += t2 - t1;
+    push_lat += t4 - t3;
+    auto expire = rdtsc() + sleep_cycles;
+    while (rdtsc() < expire)
+      ;
+  }
 }
 
-void recvthread() {
-  if (!cpupin(7)) {
+void recvthread()
+{
+  if (!cpupin(7))
+  {
     exit(1);
   }
-    auto before = rdtscp();
-    for (int i = 0; i < 99; i++) rdtscp();
-    auto after = rdtscp();
-    auto rdtscp_lat = (after - before) / 100;
+  auto before = rdtscp();
+  for (int i = 0; i < 99; i++)
+    rdtscp();
+  auto after = rdtscp();
+  auto rdtscp_lat = (after - before) / 100;
 
-    MsgQ* q = &_q;
+  std::vector<uint64_t> lat_vec;
+  lat_vec.resize(loop);
 
-    int cnt = 0;
-    long sum_lat = 0;
-    int g_val = 0;
-    uint64_t front_lat = 0;
-    uint64_t pop_lat = 0;
-    while (g_val < loop) {
-      auto t1 = rdtscp();
-      Msg* msg = q->front();
-      auto t2 = rdtscp();
-      if (!msg) continue;
-      sum_lat += t2 - msg->ts;
+  MsgQ *q = &_q;
+
+  int cnt = 0;
+  long sum_lat = 0;
+  int g_val = 0;
+  uint64_t front_lat = 0;
+  uint64_t pop_lat = 0;
+  uint64_t delta;
+  while (g_val < loop)
+  {
+    auto t1 = rdtscp();
+    Msg *msg = q->front();
+    auto t2 = rdtscp();
+    if (!msg)
+      continue;
+    delta = t2 - msg->ts;
+    lat_vec[cnt] = delta;
+    sum_lat += delta;
+    cnt++;
+    g_val++;
+    // for (int i = 0; i < msg->val_len; i++) assert(msg->val[i] == ++g_val);
+    auto t3 = rdtscp();
+    q->pop();
+    auto t4 = rdtscp();
+    // q->pop2();
+    front_lat += t2 - t1;
+    pop_lat += t4 - t3;
+
+    /*
+    q->tryPop([&](Msg* msg) {
+      long latency = rdtscp();
+      latency -= msg->ts;
+      sum_lat += latency;
       cnt++;
       for (int i = 0; i < msg->val_len; i++) assert(msg->val[i] == ++g_val);
-      auto t3 = rdtscp();
-      q->pop();
-      auto t4 = rdtscp();
-      // q->pop2();
-      front_lat += t2 - t1;
-      pop_lat += t4 - t3;
-
-      /*
-      q->tryPop([&](Msg* msg) {
-        long latency = rdtscp();
-        latency -= msg->ts;
-        sum_lat += latency;
-        cnt++;
-        for (int i = 0; i < msg->val_len; i++) assert(msg->val[i] == ++g_val);
-      });
-      */
-    }
-    std::cout << "recv done, val: " << g_val << " rdtscp_lat: " << rdtscp_lat << " avg_lat: " << (sum_lat / cnt)
-              << " alloc_lat: " << (alloc_lat / cnt - rdtscp_lat) << " push_lat: " << (push_lat / cnt - rdtscp_lat)
-              << " front_lat: " << (front_lat / cnt - rdtscp_lat) << " pop_lat: " << (pop_lat / cnt - rdtscp_lat)
-              << std::endl;
+    });
+    */
+  }
+  std::cout << "recv done, val: " << g_val << " rdtscp_lat: " << rdtscp_lat << " avg_lat: " << (sum_lat / cnt)
+            << " alloc_lat: " << (alloc_lat / cnt - rdtscp_lat) << " push_lat: " << (push_lat / cnt - rdtscp_lat)
+            << " front_lat: " << (front_lat / cnt - rdtscp_lat) << " pop_lat: " << (pop_lat / cnt - rdtscp_lat)
+            << std::endl;
+  std::sort(lat_vec.begin(), lat_vec.end());
+  std::cout << "lat 50%: " << lat_vec[lat_vec.size() / 2]
+            << " lat 90%: " << lat_vec[(lat_vec.size() * 90) / 100]
+            << " lat 99%: " << lat_vec[(lat_vec.size() * 99) / 100]
+            << " lat 99.9%: " << lat_vec[(lat_vec.size() * 999) / 1000]
+            << " lat 99.99%: " << lat_vec[(lat_vec.size() * 9999) / 10000]
+            << " worst: " << lat_vec[lat_vec.size() - 1]
+            << std::endl;
 }
 
+int main()
+{
+  std::thread trecv(recvthread);
+  std::thread tsend(sendthread);
 
-int main() {
-    std::thread trecv(recvthread);
-    std::thread tsend(sendthread);
+  tsend.join();
+  trecv.join();
 
-    tsend.join();
-    trecv.join();
-
-    return 0;
+  return 0;
 }
-
-

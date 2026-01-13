@@ -35,23 +35,23 @@ class SPSCQueueOPT
 public:
   static_assert(CNT && !(CNT & (CNT - 1)), "CNT must be a power of 2");
 
-  T* alloc() {
+  T* alloc() noexcept{
     if (free_write_cnt == 0) {
-      uint32_t rd_idx = ((std::atomic<uint32_t>*)&read_idx)->load(std::memory_order_consume);
-      free_write_cnt = (rd_idx - write_idx + CNT - 1) % CNT;
+      uint32_t rd_idx = ((std::atomic<uint32_t>*)&read_idx)->load(std::memory_order_relaxed);
+      free_write_cnt = (rd_idx - write_idx + CNT - 1) & mask;
       if (__builtin_expect(free_write_cnt == 0, 0)) return nullptr;
     }
     return &blk[write_idx].data;
   }
 
-  void push() {
+  void push() noexcept {
     ((std::atomic<bool>*)&blk[write_idx].avail)->store(true, std::memory_order_release);
-    write_idx = (write_idx + 1) % CNT;
+    write_idx = (write_idx + 1) & mask;
     free_write_cnt--;
   }
 
   template<typename Writer>
-  bool tryPush(Writer writer) {
+  bool tryPush(Writer writer) noexcept{
     T* p = alloc();
     if (!p) return false;
     writer(p);
@@ -60,24 +60,24 @@ public:
   }
 
   template<typename Writer>
-  void blockPush(Writer writer) {
+  void blockPush(Writer writer) noexcept {
     while (!tryPush(writer))
       ;
   }
 
-  T* front() {
+  T* front() noexcept {
     auto& cur_blk = blk[read_idx];
     if (!((std::atomic<bool>*)&cur_blk.avail)->load(std::memory_order_acquire)) return nullptr;
     return &cur_blk.data;
   }
 
-  void pop() {
+  void pop() noexcept {
     blk[read_idx].avail = false;
-    ((std::atomic<uint32_t>*)&read_idx)->store((read_idx + 1) % CNT, std::memory_order_release);
+    ((std::atomic<uint32_t>*)&read_idx)->store((read_idx + 1) & mask, std::memory_order_release);
   }
 
   template<typename Reader>
-  bool tryPop(Reader reader) {
+  bool tryPop(Reader reader) noexcept {
     T* v = front();
     if (!v) return false;
     reader(v);
@@ -96,6 +96,7 @@ private:
   uint32_t free_write_cnt = CNT - 1;
 
   alignas(128) uint32_t read_idx = 0;
+  uint32_t mask = CNT - 1;
 };
 
 
