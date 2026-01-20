@@ -4,6 +4,7 @@
  * RingBuffer - Main data structure combining buffer + sequencer
  *
  * This is the primary interface for most use cases.
+ * Uses compile-time polymorphism to support both single and multi-producer modes.
  */
 
 #pragma once
@@ -11,22 +12,51 @@
 #include "sequence.h"
 #include "sequence_barrier.h"
 #include "single_producer_sequencer.h"
+#include "multi_producer_sequencer.h"
 #include "wait_strategy.h"
 #include <array>
 #include <cstddef>
 #include <new>
+#include <type_traits>
 
 namespace lmax {
 
+
 /**
- * Single Producer Ring Buffer.
+ * Producer type tags for compile-time selection.
+ */
+struct SingleProducerType {};
+struct MultiProducerType {};
+
+/**
+ * Sequencer type selector - compile-time polymorphism.
+ * Selects the appropriate sequencer based on ProducerType tag.
+ */
+template<typename ProducerType, size_t Size, typename WaitStrategy>
+struct SequencerSelector;
+
+// Specialization for single producer
+template<size_t Size, typename WaitStrategy>
+struct SequencerSelector<SingleProducerType, Size, WaitStrategy> {
+    using type = SingleProducerSequencer<Size, WaitStrategy>;
+};
+
+// Specialization for multi producer
+template<size_t Size, typename WaitStrategy>
+struct SequencerSelector<MultiProducerType, Size, WaitStrategy> {
+    using type = MultiProducerSequencer<Size, WaitStrategy, 8>;
+};
+
+/**
+ * Ring Buffer - supports both single and multiple producers via compile-time polymorphism.
  *
  * Template parameters:
  * - T: Event type stored in buffer
  * - Size: Buffer size (must be power of 2)
  * - WaitStrategy: How to wait when buffer full/empty
+ * - ProducerType: SingleProducerType (default) or MultiProducerType
  */
-template<typename T, size_t Size, typename WaitStrategy = BusySpinWait>
+template<typename T, size_t Size, typename WaitStrategy = BusySpinWait, typename ProducerType = SingleProducerType>
 class RingBuffer {
     static_assert((Size & (Size - 1)) == 0, "Size must be power of 2");
     static constexpr size_t MASK = Size - 1;
@@ -35,6 +65,10 @@ public:
     using value_type = T;
     using barrier_type = SequenceBarrier<WaitStrategy>;
     using simple_barrier_type = SimpleBarrier<WaitStrategy>;
+    using sequencer_type = typename SequencerSelector<ProducerType, Size, WaitStrategy>::type;
+    using producer_type = ProducerType;
+
+    static constexpr bool is_multi_producer = std::is_same_v<ProducerType, MultiProducerType>;
 
     RingBuffer() = default;
 
@@ -141,6 +175,19 @@ public:
         return sequencer_.isAvailable(sequence);
     }
 
+    /**
+     * Get highest contiguously published sequence in range.
+     * For multi-producer, scans to find highest contiguous sequence.
+     * For single-producer, just returns availableSequence.
+     *
+     * @param lowerBound Start sequence (inclusive)
+     * @param availableSequence End sequence (inclusive)
+     * @return Highest sequence where all lower sequences are also available
+     */
+    [[nodiscard]] int64_t getHighestPublishedSequence(int64_t lowerBound, int64_t availableSequence) const noexcept {
+        return sequencer_.getHighestPublishedSequence(lowerBound, availableSequence);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // GATING (BACKPRESSURE)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -240,21 +287,54 @@ public:
         publish(seq);
     }
 
+    /**
+     * Get the sequencer (for advanced use).
+     */
+    [[nodiscard]] const sequencer_type& sequencer() const noexcept {
+        return sequencer_;
+    }
+
+    [[nodiscard]] sequencer_type& sequencer() noexcept {
+        return sequencer_;
+    }
+
 private:
     // Buffer with cache-line alignment
     alignas(128) std::array<T, Size> buffer_{};
 
-    // Sequencer (manages cursor and gating)
-    SingleProducerSequencer<Size, WaitStrategy> sequencer_;
+    // Sequencer (manages cursor and gating) - type determined at compile time
+    sequencer_type sequencer_;
 
     // For SPSCQueue compatible API
     int64_t pendingSeq_ = INITIAL_CURSOR_VALUE;
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CONVENIENCE ALIASES
+// ═══════════════════════════════════════════════════════════════════════════
+
 /**
- * Convenience alias for common use case.
+ * Single Producer Single Consumer Ring Buffer.
  */
 template<typename T, size_t Size>
-using SPSCRingBuffer = RingBuffer<T, Size, BusySpinWait>;
+using SPSCRingBuffer = RingBuffer<T, Size, BusySpinWait, SingleProducerType>;
+
+/**
+ * Multi Producer Multi Consumer Ring Buffer.
+ */
+template<typename T, size_t Size>
+using MPMCRingBuffer = RingBuffer<T, Size, BusySpinWait, MultiProducerType>;
+
+/**
+ * Single Producer Ring Buffer with custom wait strategy.
+ */
+template<typename T, size_t Size, typename WaitStrategy>
+using SPRingBuffer = RingBuffer<T, Size, WaitStrategy, SingleProducerType>;
+
+/**
+ * Multi Producer Ring Buffer with custom wait strategy.
+ */
+template<typename T, size_t Size, typename WaitStrategy>
+using MPRingBuffer = RingBuffer<T, Size, WaitStrategy, MultiProducerType>;
 
 } // namespace lmax

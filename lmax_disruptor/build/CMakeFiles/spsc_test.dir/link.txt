@@ -1,1 +1,0 @@
-/usr/bin/c++  -Wall -Wextra -O3 -march=native -DNDEBUG CMakeFiles/spsc_test.dir/test/spsc_test.cc.o -o spsc_test  -lpthread

@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/eco1011tamv/Documents/Testbed/Cpp/SPSC_Queue/lmax_disruptor/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

@@ -1,1 +1,0 @@
-/usr/bin/c++  -Wall -Wextra -O3 -march=native -DNDEBUG CMakeFiles/benchmark.dir/test/benchmark.cc.o -o benchmark  -lpthread

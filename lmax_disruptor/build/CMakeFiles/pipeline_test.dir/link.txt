@@ -1,1 +1,0 @@
-/usr/bin/c++  -Wall -Wextra -O3 -march=native -DNDEBUG CMakeFiles/pipeline_test.dir/test/pipeline_test.cc.o -o pipeline_test  -lpthread

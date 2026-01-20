@@ -77,7 +77,7 @@ struct Event
 // Calculate percentiles from pre-sorted array
 struct LatencyResult
 {
-    uint64_t min, p50, p90, p99, p999, max;
+    uint64_t min, p50, p90, p99, p999, p9999, max;
     double mean;
     size_t count;
     size_t outliers; // Count of filtered outliers
@@ -112,6 +112,7 @@ struct LatencyResult
         p90 = data[(size_t)(effectiveN * 0.90)];
         p99 = data[(size_t)(effectiveN * 0.99)];
         p999 = data[(size_t)(effectiveN * 0.999)];
+        p9999 = data[(size_t)(effectiveN * 0.9999)];
 
         uint64_t sum = 0;
         for (size_t i = 0; i < effectiveN; i++)
@@ -493,6 +494,7 @@ void printLatency(const char *name, const LatencyResult &r, double cpuGhz)
               << "p90=" << std::setw(5) << toNs(r.p90) << "ns, "
               << "p99=" << std::setw(6) << toNs(r.p99) << "ns, "
               << "p99.9=" << std::setw(7) << toNs(r.p999) << "ns, "
+              << "p99.99=" << std::setw(8) << toNs(r.p9999) << "ns, "
               << "max=" << std::setw(8) << toNs(r.max) << "ns";
     if (r.outliers > 0)
     {
@@ -507,7 +509,7 @@ int main()
     constexpr size_t THROUGHPUT_MESSAGES = 10000000;
     constexpr int PRODUCER_CPU = 2;
     constexpr int CONSUMER_CPU = 3;
-    constexpr double CPU_GHZ = 2.3;            // Adjust for your CPU
+    constexpr double CPU_GHZ = 2.9;            // Adjust for your CPU
     constexpr uint64_t THROTTLE_CYCLES = 1000; // ~430ns @ 2.3GHz
 
     std::cout << "═══════════════════════════════════════════════════════════════════════════\n";

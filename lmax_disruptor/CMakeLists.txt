@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(lmax_disruptor VERSION 1.0.0 LANGUAGES CXX)
+project(lmax_disruptor VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,14 +26,32 @@ target_link_libraries(spsc_test PRIVATE lmax_disruptor pthread)
 add_executable(pipeline_test test/pipeline_test.cc)
 target_link_libraries(pipeline_test PRIVATE lmax_disruptor pthread)
 
+# Multi-Producer Test
+add_executable(multi_producer_test test/multi_producer_test.cc)
+target_link_libraries(multi_producer_test PRIVATE lmax_disruptor pthread)
+
+# Processor Test (BatchEventProcessor, Pipeline)
+add_executable(processor_test test/processor_test.cc)
+target_link_libraries(processor_test PRIVATE lmax_disruptor pthread)
+
 # Benchmark (compares with SPSCQueue)
 add_executable(benchmark test/benchmark.cc)
 target_link_libraries(benchmark PRIVATE lmax_disruptor pthread)
 # Apply optimizations specifically to this target
-target_compile_options(benchmark PRIVATE 
-    -O3 
-    -march=native 
-    -ffast-math 
+target_compile_options(benchmark PRIVATE
+    -O3
+    -march=native
+    -ffast-math
+    -flto
+)
+
+# MPMC Benchmark (multi-producer, pipeline, batch processor)
+add_executable(mpmc_benchmark test/mpmc_benchmark.cc)
+target_link_libraries(mpmc_benchmark PRIVATE lmax_disruptor pthread)
+target_compile_options(mpmc_benchmark PRIVATE
+    -O3
+    -march=native
+    -ffast-math
     -flto
 )
 
@@ -41,15 +59,23 @@ target_compile_options(benchmark PRIVATE
 enable_testing()
 add_test(NAME spsc_test COMMAND spsc_test)
 add_test(NAME pipeline_test COMMAND pipeline_test)
+add_test(NAME multi_producer_test COMMAND multi_producer_test)
+add_test(NAME processor_test COMMAND processor_test)
 
 # Custom target to run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS spsc_test pipeline_test
+    DEPENDS spsc_test pipeline_test multi_producer_test processor_test
 )
 
 # Custom target for benchmark
 add_custom_target(run_benchmark
     COMMAND benchmark
     DEPENDS benchmark
+)
+
+# Custom target for MPMC benchmark
+add_custom_target(run_mpmc_benchmark
+    COMMAND mpmc_benchmark
+    DEPENDS mpmc_benchmark
 )
