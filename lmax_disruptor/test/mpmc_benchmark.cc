@@ -739,6 +739,84 @@ LatencyStats benchmarkDiamondLatency(size_t numMessages, double cyclesPerNs, uin
     return calculateLatencyStats(latencies, cyclesPerNs);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Batch Processing Latency Benchmark (busy-spin for low latency)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// This simulates what BatchEventProcessor does but with busy-spin instead of yield
+// to measure the true latency potential of batch processing
+LatencyStats benchmarkBatchProcessorLatency(size_t numMessages, double cyclesPerNs, uint64_t throttleCycles)
+{
+    constexpr size_t BUFFER_SIZE = 65536;
+    lmax::RingBuffer<Event, BUFFER_SIZE> ring;
+    lmax::Sequence consumerSeq;
+
+    ring.addGatingSequence(consumerSeq);
+
+    std::vector<uint64_t> latencies(numMessages);
+    std::atomic<bool> consumerReady{false};
+
+    // Consumer thread - batch processing with busy-spin
+    std::thread consumer([&]()
+                         {
+        pinThread(3);
+        const lmax::Sequence& cursor = ring.cursor();
+        int64_t nextSeq = 0;
+        size_t idx = 0;
+
+        consumerReady.store(true, std::memory_order_release);
+
+        while (nextSeq < (int64_t)numMessages) {
+            // Busy-spin poll (not yield)
+            int64_t available = cursor.getRelaxed();
+            if (available < nextSeq) {
+                _mm_pause();
+                continue;
+            }
+
+            std::atomic_thread_fence(std::memory_order_acquire);
+
+            // Process batch - measure latency for each message in the batch
+            while (nextSeq <= available && nextSeq < (int64_t)numMessages) {
+                const Event* e = ring.get(nextSeq);
+                uint64_t endTime = rdtscp();
+                latencies[idx++] = endTime - e->timestamp;
+                nextSeq++;
+            }
+
+            // Update consumer sequence after batch (like BatchEventProcessor does)
+            consumerSeq.set(nextSeq - 1);
+        } });
+
+    // Wait for consumer to be ready
+    while (!consumerReady.load(std::memory_order_acquire))
+    {
+        _mm_pause();
+    }
+
+    // Producer with throttling
+    pinThread(2);
+    for (size_t i = 0; i < numMessages; i++)
+    {
+        if (throttleCycles > 0)
+        {
+            spinWait(throttleCycles);
+        }
+
+        int64_t seq = ring.next();
+        Event *e = ring.get(seq);
+        e->sequence = i;
+
+        std::atomic_thread_fence(std::memory_order_release);
+        e->timestamp = rdtscp();
+        ring.publish(seq);
+    }
+
+    consumer.join();
+
+    return calculateLatencyStats(latencies, cyclesPerNs);
+}
+
 void printLatencyStats(const std::string &name, const LatencyStats &stats)
 {
     std::cout << name << ":\n";
@@ -842,6 +920,12 @@ int main()
     std::cout << "Running SPSC latency test (" << LATENCY_MESSAGES << " messages)...\n";
     auto spscLatency = benchmarkSPSCLatency(LATENCY_MESSAGES, cyclesPerNs, THROTTLE_CYCLES);
     printLatencyStats("SPSC Latency", spscLatency);
+    std::cout << "\n";
+
+    // Batch Processor Latency
+    std::cout << "Running Batch Processor latency test (" << LATENCY_MESSAGES << " messages)...\n";
+    auto batchLatency = benchmarkBatchProcessorLatency(LATENCY_MESSAGES, cyclesPerNs, THROTTLE_CYCLES);
+    printLatencyStats("Batch Processor Latency", batchLatency);
     std::cout << "\n";
 
     // Diamond Latency
