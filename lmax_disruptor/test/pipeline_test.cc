@@ -1,12 +1,13 @@
 /*
  * Pipeline Test - WAL -> Replicator -> ME pattern
  *
- * Demonstrates multi-consumer dependency chain:
+ * Demonstrates multi-consumer dependency chain with alert-based shutdown:
  * - Producer publishes to ring
  * - WAL handler processes first (waits on cursor)
  * - Replicator processes next (waits on WAL sequence)
  * - Matching Engine processes last (waits on Replicator sequence)
  * - ME is the gating sequence (slowest consumer gates producer)
+ * - Uses barrier.alert() for clean shutdown (no polling needed)
  */
 
 #include <iostream>
@@ -30,6 +31,7 @@ struct OrderEvent {
 int main() {
     std::cout << "═══════════════════════════════════════════════════════════════════\n";
     std::cout << "          Pipeline Test: WAL -> Replicator -> ME\n";
+    std::cout << "          (Using alert-based shutdown with waitFor)\n";
     std::cout << "═══════════════════════════════════════════════════════════════════\n\n";
 
     constexpr size_t NUM_ORDERS = 100000;
@@ -45,18 +47,26 @@ int main() {
     // ME is the gating sequence (slowest consumer gates producer)
     ring.addGatingSequence(meSeq);
 
-    std::atomic<bool> done{false};
+    // Create barriers OUTSIDE threads so we can alert them on shutdown
+    auto walBarrier = ring.newBarrier();  // SimpleBarrier - waits on cursor
+    auto replBarrier = ring.newBarrier({&walSeq});  // SequenceBarrier - waits on WAL
+    auto meBarrier = ring.newBarrier({&replSeq});   // SequenceBarrier - waits on Replicator
+
     std::atomic<uint64_t> walProcessed{0};
     std::atomic<uint64_t> replProcessed{0};
     std::atomic<uint64_t> meProcessed{0};
 
     // WAL Handler - waits on cursor (first in chain)
     std::thread walHandler([&]() {
-        auto barrier = ring.newBarrier();  // Waits on cursor
         int64_t nextSeq = 0;
 
-        while (!done.load(std::memory_order_relaxed) || nextSeq <= ring.getCursor()) {
-            int64_t available = barrier.available();
+        while (true) {
+            int64_t available = walBarrier.waitFor(nextSeq);  // Uses YieldingWait strategy
+
+            // Check if we were alerted (shutdown signal)
+            if (available == lmax::ALERTED) {
+                break;
+            }
 
             while (nextSeq <= available) {
                 OrderEvent* e = const_cast<OrderEvent*>(ring.get(nextSeq));
@@ -66,19 +76,21 @@ int main() {
                 nextSeq++;
             }
 
-            if (nextSeq > 0) {
-                walSeq.set(nextSeq - 1);
-            }
+            walSeq.set(nextSeq - 1);
         }
     });
 
     // Replicator - waits on WAL sequence
     std::thread replicator([&]() {
-        auto barrier = ring.newBarrier({&walSeq});  // Waits on WAL
         int64_t nextSeq = 0;
 
-        while (!done.load(std::memory_order_relaxed) || nextSeq <= walSeq.get()) {
-            int64_t available = barrier.available();
+        while (true) {
+            int64_t available = replBarrier.waitFor(nextSeq);  // Uses YieldingWait strategy
+
+            // Check if we were alerted (shutdown signal)
+            if (available == lmax::ALERTED) {
+                break;
+            }
 
             while (nextSeq <= available) {
                 OrderEvent* e = const_cast<OrderEvent*>(ring.get(nextSeq));
@@ -89,19 +101,21 @@ int main() {
                 nextSeq++;
             }
 
-            if (nextSeq > 0) {
-                replSeq.set(nextSeq - 1);
-            }
+            replSeq.set(nextSeq - 1);
         }
     });
 
     // Matching Engine - waits on Replicator sequence
     std::thread matchingEngine([&]() {
-        auto barrier = ring.newBarrier({&replSeq});  // Waits on Replicator
         int64_t nextSeq = 0;
 
-        while (!done.load(std::memory_order_relaxed) || nextSeq <= replSeq.get()) {
-            int64_t available = barrier.available();
+        while (true) {
+            int64_t available = meBarrier.waitFor(nextSeq);  // Uses YieldingWait strategy
+
+            // Check if we were alerted (shutdown signal)
+            if (available == lmax::ALERTED) {
+                break;
+            }
 
             while (nextSeq <= available) {
                 const OrderEvent* e = ring.get(nextSeq);
@@ -112,9 +126,7 @@ int main() {
                 nextSeq++;
             }
 
-            if (nextSeq > 0) {
-                meSeq.set(nextSeq - 1);  // Gates producer
-            }
+            meSeq.set(nextSeq - 1);  // Gates producer
         }
     });
 
@@ -134,14 +146,17 @@ int main() {
         ring.publish(seq);
     }
 
-    // Wait for all consumers to finish
+    // Wait for all consumers to finish processing
     while (meProcessed.load(std::memory_order_relaxed) < NUM_ORDERS) {
         std::this_thread::yield();
     }
 
-    done.store(true, std::memory_order_relaxed);
-
     auto end = std::chrono::high_resolution_clock::now();
+
+    // Alert all barriers to signal shutdown (systematic cleanup)
+    walBarrier.alert();
+    replBarrier.alert();
+    meBarrier.alert();
 
     walHandler.join();
     replicator.join();

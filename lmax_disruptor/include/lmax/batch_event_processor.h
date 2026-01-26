@@ -122,11 +122,15 @@ public:
 
     /**
      * Request the processor to halt after completing current batch.
+     * Alerts the barrier to interrupt any blocking waitFor() call.
      */
     void halt() noexcept {
         ProcessorState expected = ProcessorState::RUNNING;
-        state_.compare_exchange_strong(expected, ProcessorState::HALTING,
-                                      std::memory_order_acq_rel);
+        if (state_.compare_exchange_strong(expected, ProcessorState::HALTING,
+                                          std::memory_order_acq_rel)) {
+            // Alert the barrier to wake up from waitFor()
+            barrier_.alert();
+        }
     }
 
     /**
@@ -143,58 +147,35 @@ public:
      * Use this for manual control instead of start().
      */
     void run() {
-        try {
-            handler_.onStart();
-        } catch (std::exception& ex) {
-            // Allow handler to handle startup exception
-            throw;
-        }
+        handler_.onStart();
 
         int64_t nextSequence = sequence_.get() + 1;
 
         while (state_.load(std::memory_order_acquire) == ProcessorState::RUNNING) {
-            try {
-                // Check if data is available (non-blocking first)
-                int64_t availableSequence = barrier_.available();
+            int64_t availableSequence = barrier_.waitFor(nextSequence);
 
-                if (availableSequence < nextSequence) {
-                    // No data available, yield and check state again
-                    std::this_thread::yield();
-                    continue;
+            if (availableSequence == ALERTED) {
+                break;
+            }
+
+            while (nextSequence <= availableSequence) {
+                T* event = const_cast<T*>(ringBuffer_.get(nextSequence));
+                bool endOfBatch = (nextSequence == availableSequence);
+
+                try {
+                    handler_.onEvent(*event, nextSequence, endOfBatch);
+                } catch (std::exception& ex) {
+                    handler_.onException(ex, nextSequence, *event);
                 }
 
-                // Process all available events in a batch
-                while (nextSequence <= availableSequence) {
-                    T* event = const_cast<T*>(ringBuffer_.get(nextSequence));
-                    bool endOfBatch = (nextSequence == availableSequence);
-
-                    try {
-                        handler_.onEvent(*event, nextSequence, endOfBatch);
-                    } catch (std::exception& ex) {
-                        handler_.onException(ex, nextSequence, *event);
-                    }
-
-                    ++nextSequence;
-                }
-
-                // Update our sequence to indicate we've processed up to here
-                sequence_.set(availableSequence);
-
-            } catch (...) {
-                // Handle unexpected exceptions by advancing past the problematic event
-                sequence_.set(nextSequence);
                 ++nextSequence;
             }
+
+            sequence_.set(availableSequence);
         }
 
-        // Mark as fully halted
         state_.store(ProcessorState::HALTED, std::memory_order_release);
-
-        try {
-            handler_.onShutdown();
-        } catch (...) {
-            // Ignore shutdown exceptions
-        }
+        handler_.onShutdown();
     }
 
 private:

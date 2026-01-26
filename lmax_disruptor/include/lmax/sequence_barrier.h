@@ -12,9 +12,13 @@
 #include "sequence.h"
 #include "wait_strategy.h"
 #include <array>
+#include <atomic>
 #include <cstddef>
 
 namespace lmax {
+
+/// Special return value indicating barrier was alerted during wait
+constexpr int64_t ALERTED = -2;
 
 /**
  * Sequence barrier for consumers.
@@ -63,12 +67,15 @@ public:
      * Wait for a sequence to become available.
      *
      * @param sequence The sequence to wait for
-     * @return The highest available sequence (may be > requested)
+     * @return The highest available sequence (may be > requested), or ALERTED if interrupted
      */
     inline __attribute__((always_inline)) int64_t waitFor(int64_t sequence) noexcept {
         // First check cursor (producer's published sequence)
         int64_t availableSequence;
         while ((availableSequence = cursor_.get()) < sequence) {
+            if (alerted_.load(std::memory_order_acquire)) {
+                return ALERTED;
+            }
             wait_.wait();
         }
         wait_.reset();
@@ -76,12 +83,37 @@ public:
         // If we have dependencies, wait for them too
         if (dependencyCount_ > 0) {
             while ((availableSequence = getMinDependencySequence()) < sequence) {
+                if (alerted_.load(std::memory_order_acquire)) {
+                    return ALERTED;
+                }
                 wait_.wait();
             }
             wait_.reset();
         }
 
         return availableSequence;
+    }
+
+    /**
+     * Alert the barrier to interrupt any waiting consumers.
+     * Consumers will return ALERTED from waitFor().
+     */
+    void alert() noexcept {
+        alerted_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * Clear the alert status.
+     */
+    void clearAlert() noexcept {
+        alerted_.store(false, std::memory_order_release);
+    }
+
+    /**
+     * Check if the barrier is alerted.
+     */
+    [[nodiscard]] bool isAlerted() const noexcept {
+        return alerted_.load(std::memory_order_acquire);
     }
 
     /**
@@ -135,6 +167,7 @@ private:
     std::array<const Sequence*, MaxDependencies> dependencies_{};
     size_t dependencyCount_;
     WaitStrategy wait_;
+    std::atomic<bool> alerted_{false};
 };
 
 /**
@@ -148,9 +181,18 @@ public:
         : cursor_(cursor)
     {}
 
+    /**
+     * Wait for a sequence to become available.
+     *
+     * @param sequence The sequence to wait for
+     * @return The highest available sequence, or ALERTED if interrupted
+     */
     inline __attribute__((always_inline)) int64_t waitFor(int64_t sequence) noexcept {
         int64_t availableSequence;
         while ((availableSequence = cursor_.get()) < sequence) {
+            if (alerted_.load(std::memory_order_acquire)) {
+                return ALERTED;
+            }
             wait_.wait();
         }
         wait_.reset();
@@ -174,9 +216,31 @@ public:
         return cursor_.get() >= sequence;
     }
 
+    /**
+     * Alert the barrier to interrupt any waiting consumers.
+     */
+    void alert() noexcept {
+        alerted_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * Clear the alert status.
+     */
+    void clearAlert() noexcept {
+        alerted_.store(false, std::memory_order_release);
+    }
+
+    /**
+     * Check if the barrier is alerted.
+     */
+    [[nodiscard]] bool isAlerted() const noexcept {
+        return alerted_.load(std::memory_order_acquire);
+    }
+
 private:
     const Sequence& cursor_;
     WaitStrategy wait_;
+    std::atomic<bool> alerted_{false};
 };
 
 } // namespace lmax
