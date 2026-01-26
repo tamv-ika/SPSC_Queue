@@ -4,10 +4,10 @@
  * Disruptor DSL - Domain Specific Language for easy disruptor setup
  *
  * Provides a fluent API for configuring:
- * - Event handlers
- * - Handler chains (pipelines)
- * - Worker pools
- * - Gating sequences
+ * - Event handlers and handler chains (pipelines)
+ * - Parallel handlers (diamond patterns)
+ * - Explicit dependencies with after()
+ * - Automatic gating sequence management
  */
 
 #pragma once
@@ -22,63 +22,78 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <set>
 
 namespace lmax {
 
-/**
- * Handler group - represents a set of handlers that process events in parallel.
- * Used internally by the Disruptor DSL.
- */
-template<typename T, typename RingBufferType>
-class EventHandlerGroup {
-public:
-    using BarrierType = typename RingBufferType::barrier_type;
-    using SimpleBarrierType = typename RingBufferType::simple_barrier_type;
+// Forward declarations
+template<typename T, size_t Size, typename WaitStrategy, typename ProducerType>
+class Disruptor;
 
-    EventHandlerGroup(RingBufferType& ringBuffer,
-                     std::vector<const Sequence*> sequences)
-        : ringBuffer_(ringBuffer)
+/**
+ * HandlerGroup - Represents handlers added in a single handleEventsWith/then call.
+ * Used for building dependency chains with then() and after().
+ */
+template<typename T, size_t Size, typename WaitStrategy, typename ProducerType>
+class HandlerGroup {
+public:
+    using DisruptorType = Disruptor<T, Size, WaitStrategy, ProducerType>;
+
+    HandlerGroup(DisruptorType& disruptor, std::vector<const Sequence*> sequences)
+        : disruptor_(disruptor)
         , sequences_(std::move(sequences))
     {}
 
     /**
-     * Get the sequences for all handlers in this group.
-     * Used for building dependency chains.
+     * Add handler(s) that depend on ALL handlers in this group.
+     *
+     * Example:
+     *   disruptor.handleEventsWith(h1).then(h2);  // h2 waits for h1
+     *   disruptor.handleEventsWith(h1, h2).then(h3);  // h3 waits for both h1 AND h2
+     */
+    template<typename... Handlers>
+    HandlerGroup& then(Handlers&... handlers);
+
+    /**
+     * Add handler(s) that depend on specific handler groups.
+     *
+     * Example:
+     *   auto g1 = disruptor.handleEventsWith(h1);
+     *   auto g2 = disruptor.handleEventsWith(h2);
+     *   disruptor.after(g1, g2).handleEventsWith(h3);  // h3 waits for h1 AND h2
+     */
+    template<typename... Handlers>
+    HandlerGroup& handleEventsWith(Handlers&... handlers);
+
+    /**
+     * Get sequences for all handlers in this group.
      */
     [[nodiscard]] const std::vector<const Sequence*>& getSequences() const noexcept {
         return sequences_;
     }
 
 private:
-    RingBufferType& ringBuffer_;
+    DisruptorType& disruptor_;
     std::vector<const Sequence*> sequences_;
 };
 
 /**
  * Disruptor - Main orchestration class for setting up event processing pipelines.
  *
- * Template parameters:
- * - T: Event type
- * - Size: Ring buffer size (must be power of 2)
- * - WaitStrategy: Wait strategy for the ring buffer
- * - ProducerType: SingleProducerType or MultiProducerType
- *
  * Example usage:
- *   Disruptor<MyEvent, 1024> disruptor;
  *
- *   // Simple chain: handler1 -> handler2 -> handler3
- *   disruptor.handleEventsWith(handler1)
- *           .then(handler2)
- *           .then(handler3);
+ *   // Simple chain: h1 -> h2 -> h3
+ *   Disruptor<Event, 1024> d;
+ *   d.handleEventsWith(h1).then(h2).then(h3);
+ *   d.start();
  *
- *   // Diamond pattern: handler1 -> (handler2a, handler2b) -> handler3
- *   disruptor.handleEventsWith(handler1)
- *           .then(handler2a, handler2b)
- *           .then(handler3);
+ *   // Parallel handlers: h1 -> (h2a, h2b) -> h3
+ *   d.handleEventsWith(h1).then(h2a, h2b).then(h3);
  *
- *   disruptor.start();
- *   // ... publish events ...
- *   disruptor.shutdown();
+ *   // Diamond pattern with after():
+ *   auto g1 = d.handleEventsWith(h1);
+ *   auto g2 = d.handleEventsWith(h2);
+ *   d.after(g1, g2).handleEventsWith(h3);
  */
 template<typename T, size_t Size, typename WaitStrategy = BusySpinWait, typename ProducerType = SingleProducerType>
 class Disruptor {
@@ -86,10 +101,10 @@ public:
     using RingBufferType = RingBuffer<T, Size, WaitStrategy, ProducerType>;
     using BarrierType = typename RingBufferType::barrier_type;
     using SimpleBarrierType = typename RingBufferType::simple_barrier_type;
+    using HandlerGroupType = HandlerGroup<T, Size, WaitStrategy, ProducerType>;
 
     Disruptor() = default;
 
-    // Non-copyable, non-movable
     Disruptor(const Disruptor&) = delete;
     Disruptor& operator=(const Disruptor&) = delete;
 
@@ -109,55 +124,41 @@ public:
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // HANDLER CONFIGURATION - Fluent API
+    // HANDLER CONFIGURATION
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Configure the first handler(s) in the pipeline.
-     * These handlers depend only on the producer.
-     *
-     * @param handlers One or more handlers to process events in parallel
-     * @return HandlerChain for chaining additional handlers
+     * Configure handler(s) that depend only on the producer.
+     * Multiple handlers will process events in parallel.
      */
     template<typename... Handlers>
-    class HandlerChain& handleEventsWith(Handlers&... handlers) {
-        return createHandlerChain({}, handlers...);
+    HandlerGroupType& handleEventsWith(Handlers&... handlers) {
+        std::vector<const Sequence*> dependencies;  // Empty = depends on cursor only
+        return createHandlerGroup(dependencies, handlers...);
     }
 
     /**
-     * Chain of handlers - allows building complex pipelines.
+     * Create a dependency specification for multiple handler groups.
+     * Use with handleEventsWith() to create handlers that depend on all specified groups.
+     *
+     * Example:
+     *   auto g1 = d.handleEventsWith(h1);
+     *   auto g2 = d.handleEventsWith(h2);
+     *   d.after(g1, g2).handleEventsWith(h3);
      */
-    class HandlerChain {
-    public:
-        HandlerChain(Disruptor& disruptor, std::vector<const Sequence*> dependencies)
-            : disruptor_(disruptor)
-            , dependencies_(std::move(dependencies))
-        {}
+    HandlerGroupType& after(const HandlerGroupType& group) {
+        std::vector<const Sequence*> deps = group.getSequences();
+        afterDependencies_ = std::move(deps);
+        return afterGroup();
+    }
 
-        /**
-         * Add handler(s) that depend on all previous handlers in this chain.
-         */
-        template<typename... Handlers>
-        HandlerChain& then(Handlers&... handlers) {
-            return disruptor_.createHandlerChain(dependencies_, handlers...);
-        }
-
-        /**
-         * Get sequences for handlers in this chain (for custom dependencies).
-         */
-        [[nodiscard]] const std::vector<const Sequence*>& getSequences() const noexcept {
-            return ownSequences_;
-        }
-
-        void setOwnSequences(std::vector<const Sequence*> sequences) {
-            ownSequences_ = std::move(sequences);
-        }
-
-    private:
-        Disruptor& disruptor_;
-        std::vector<const Sequence*> dependencies_;
-        std::vector<const Sequence*> ownSequences_;
-    };
+    template<typename... Groups>
+    HandlerGroupType& after(const HandlerGroupType& first, const Groups&... rest) {
+        std::vector<const Sequence*> deps = first.getSequences();
+        collectDependencies(deps, rest...);
+        afterDependencies_ = std::move(deps);
+        return afterGroup();
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // LIFECYCLE
@@ -168,30 +169,29 @@ public:
      */
     void start() {
         if (started_.exchange(true)) {
-            return;  // Already started
+            return;
         }
 
-        // Start all processors
+        // Update gating sequences - only gate on consumers that have no dependents
+        updateGatingSequences();
+
         for (auto& processor : processors_) {
             processor->start();
         }
     }
 
     /**
-     * Shutdown all event processors.
-     * Waits for all processors to complete current events.
+     * Shutdown all event processors gracefully.
      */
     void shutdown() {
         if (!started_.load()) {
             return;
         }
 
-        // Halt all processors
         for (auto& processor : processors_) {
             processor->halt();
         }
 
-        // Join all processor threads
         for (auto& processor : processors_) {
             processor->join();
         }
@@ -200,113 +200,71 @@ public:
     }
 
     /**
-     * Check if the disruptor has been started.
+     * Check if disruptor is running.
      */
-    [[nodiscard]] bool isStarted() const noexcept {
+    [[nodiscard]] bool isRunning() const noexcept {
         return started_.load(std::memory_order_acquire);
     }
 
+    /**
+     * Get cursor value (last published sequence).
+     */
+    [[nodiscard]] int64_t getCursor() const noexcept {
+        return ringBuffer_.getCursor();
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
-    // PUBLISHING (convenience methods)
+    // PUBLISHING
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Publish a single event using a translator function.
+     * Publish event using translator (blocking).
      */
     template<typename Translator>
     void publishEvent(Translator&& translator) {
-        int64_t sequence = ringBuffer_.next();
-        T* event = ringBuffer_.get(sequence);
-        translator(*event, sequence);
-        ringBuffer_.publish(sequence);
+        int64_t seq = ringBuffer_.next();
+        T* event = ringBuffer_.get(seq);
+        translator(*event, seq);
+        ringBuffer_.publish(seq);
     }
 
     /**
-     * Try to publish a single event (non-blocking).
+     * Try to publish event (non-blocking).
      */
     template<typename Translator>
     bool tryPublishEvent(Translator&& translator) {
-        int64_t sequence = ringBuffer_.tryNext();
-        if (sequence == INITIAL_CURSOR_VALUE) {
+        int64_t seq = ringBuffer_.tryNext();
+        if (seq == INITIAL_CURSOR_VALUE) {
             return false;
         }
-        T* event = ringBuffer_.get(sequence);
-        translator(*event, sequence);
-        ringBuffer_.publish(sequence);
+        T* event = ringBuffer_.get(seq);
+        translator(*event, seq);
+        ringBuffer_.publish(seq);
         return true;
     }
 
+    /**
+     * Publish batch of events.
+     */
+    template<typename Translator>
+    void publishEvents(Translator&& translator, size_t count) {
+        int64_t hiSeq = ringBuffer_.next(count);
+        int64_t loSeq = hiSeq - count + 1;
+        for (int64_t seq = loSeq; seq <= hiSeq; seq++) {
+            T* event = ringBuffer_.get(seq);
+            translator(*event, seq);
+        }
+        ringBuffer_.publish(loSeq, hiSeq);
+    }
+
 private:
-    /**
-     * Internal method to create a handler chain with dependencies.
-     */
-    template<typename Handler, typename... MoreHandlers>
-    HandlerChain& createHandlerChain(const std::vector<const Sequence*>& dependencies,
-                                     Handler& handler, MoreHandlers&... moreHandlers) {
-        std::vector<const Sequence*> newSequences;
-
-        // Create processor for first handler
-        createProcessor(handler, dependencies, newSequences);
-
-        // Recursively create processors for remaining handlers
-        if constexpr (sizeof...(MoreHandlers) > 0) {
-            createHandlerChain(dependencies, moreHandlers...);
-            // Get sequences from all handlers created
-        }
-
-        // Create and store the chain
-        handlerChains_.emplace_back(std::make_unique<HandlerChain>(*this, newSequences));
-        handlerChains_.back()->setOwnSequences(newSequences);
-
-        return *handlerChains_.back();
-    }
+    friend class HandlerGroup<T, Size, WaitStrategy, ProducerType>;
 
     /**
-     * Create a single processor for a handler.
-     */
-    void createProcessor(EventHandler<T>& handler,
-                        const std::vector<const Sequence*>& dependencies,
-                        std::vector<const Sequence*>& outSequences) {
-        // Create barrier based on dependencies
-        if (dependencies.empty()) {
-            // No dependencies - create simple barrier on cursor
-            auto barrier = std::make_unique<SimpleBarrierType>(ringBuffer_.cursor());
-            auto processor = std::make_unique<ProcessorWrapper>(
-                ringBuffer_, *barrier, handler);
-
-            outSequences.push_back(&processor->getSequence());
-
-            // Add to gating sequences (so producer waits for this consumer)
-            ringBuffer_.addGatingSequence(processor->getSequence());
-
-            barriers_.push_back(std::move(barrier));
-            processors_.push_back(std::move(processor));
-        } else {
-            // Has dependencies - create barrier with dependency sequences
-            auto barrier = std::make_unique<BarrierType>(ringBuffer_.cursor());
-            for (const Sequence* dep : dependencies) {
-                barrier->addDependency(*dep);
-            }
-
-            auto processor = std::make_unique<ProcessorWrapper>(
-                ringBuffer_, *barrier, handler);
-
-            outSequences.push_back(&processor->getSequence());
-
-            // Add to gating sequences
-            ringBuffer_.addGatingSequence(processor->getSequence());
-
-            dependencyBarriers_.push_back(std::move(barrier));
-            processors_.push_back(std::move(processor));
-        }
-    }
-
-    /**
-     * Type-erased processor wrapper to store different processor types.
+     * Type-erased processor wrapper.
      */
     class ProcessorWrapper {
     public:
-        // Constructor for simple barrier
         ProcessorWrapper(RingBufferType& ringBuffer,
                         SimpleBarrierType& barrier,
                         EventHandler<T>& handler)
@@ -315,7 +273,6 @@ private:
                     ringBuffer, barrier, handler))
         {}
 
-        // Constructor for dependency barrier
         ProcessorWrapper(RingBufferType& ringBuffer,
                         BarrierType& barrier,
                         EventHandler<T>& handler)
@@ -325,33 +282,22 @@ private:
         {}
 
         void start() {
-            if (simpleProcessor_) {
-                simpleProcessor_->start();
-            } else if (depProcessor_) {
-                depProcessor_->start();
-            }
+            if (simpleProcessor_) simpleProcessor_->start();
+            else if (depProcessor_) depProcessor_->start();
         }
 
         void halt() {
-            if (simpleProcessor_) {
-                simpleProcessor_->halt();
-            } else if (depProcessor_) {
-                depProcessor_->halt();
-            }
+            if (simpleProcessor_) simpleProcessor_->halt();
+            else if (depProcessor_) depProcessor_->halt();
         }
 
         void join() {
-            if (simpleProcessor_) {
-                simpleProcessor_->join();
-            } else if (depProcessor_) {
-                depProcessor_->join();
-            }
+            if (simpleProcessor_) simpleProcessor_->join();
+            else if (depProcessor_) depProcessor_->join();
         }
 
         [[nodiscard]] const Sequence& getSequence() const {
-            if (simpleProcessor_) {
-                return simpleProcessor_->getSequence();
-            }
+            if (simpleProcessor_) return simpleProcessor_->getSequence();
             return depProcessor_->getSequence();
         }
 
@@ -360,27 +306,159 @@ private:
         std::unique_ptr<BatchEventProcessor<T, RingBufferType, BarrierType>> depProcessor_;
     };
 
+    /**
+     * Create handler group with dependencies.
+     */
+    template<typename Handler>
+    HandlerGroupType& createHandlerGroup(const std::vector<const Sequence*>& dependencies,
+                                          Handler& handler) {
+        std::vector<const Sequence*> sequences;
+        createProcessor(handler, dependencies, sequences);
+
+        handlerGroups_.emplace_back(
+            std::make_unique<HandlerGroupType>(*this, std::move(sequences)));
+        return *handlerGroups_.back();
+    }
+
+    template<typename Handler, typename... MoreHandlers>
+    HandlerGroupType& createHandlerGroup(const std::vector<const Sequence*>& dependencies,
+                                          Handler& handler, MoreHandlers&... more) {
+        std::vector<const Sequence*> sequences;
+
+        // Create processor for this handler
+        createProcessor(handler, dependencies, sequences);
+
+        // Create processors for remaining handlers (all with same dependencies)
+        createProcessors(dependencies, sequences, more...);
+
+        handlerGroups_.emplace_back(
+            std::make_unique<HandlerGroupType>(*this, std::move(sequences)));
+        return *handlerGroups_.back();
+    }
+
+    template<typename Handler>
+    void createProcessors(const std::vector<const Sequence*>& dependencies,
+                          std::vector<const Sequence*>& sequences,
+                          Handler& handler) {
+        createProcessor(handler, dependencies, sequences);
+    }
+
+    template<typename Handler, typename... MoreHandlers>
+    void createProcessors(const std::vector<const Sequence*>& dependencies,
+                          std::vector<const Sequence*>& sequences,
+                          Handler& handler, MoreHandlers&... more) {
+        createProcessor(handler, dependencies, sequences);
+        createProcessors(dependencies, sequences, more...);
+    }
+
+    /**
+     * Create a single processor.
+     */
+    void createProcessor(EventHandler<T>& handler,
+                        const std::vector<const Sequence*>& dependencies,
+                        std::vector<const Sequence*>& outSequences) {
+        if (dependencies.empty()) {
+            auto barrier = std::make_unique<SimpleBarrierType>(ringBuffer_.cursor());
+            auto processor = std::make_unique<ProcessorWrapper>(
+                ringBuffer_, *barrier, handler);
+
+            const Sequence* seq = &processor->getSequence();
+            outSequences.push_back(seq);
+            allSequences_.push_back(seq);
+
+            barriers_.push_back(std::move(barrier));
+            processors_.push_back(std::move(processor));
+        } else {
+            auto barrier = std::make_unique<BarrierType>(ringBuffer_.cursor());
+            for (const Sequence* dep : dependencies) {
+                barrier->addDependency(*dep);
+                // Track that 'dep' has a dependent
+                sequencesWithDependents_.insert(dep);
+            }
+
+            auto processor = std::make_unique<ProcessorWrapper>(
+                ringBuffer_, *barrier, handler);
+
+            const Sequence* seq = &processor->getSequence();
+            outSequences.push_back(seq);
+            allSequences_.push_back(seq);
+
+            dependencyBarriers_.push_back(std::move(barrier));
+            processors_.push_back(std::move(processor));
+        }
+    }
+
+    /**
+     * Update gating sequences - only gate on final consumers (those with no dependents).
+     */
+    void updateGatingSequences() {
+        for (const Sequence* seq : allSequences_) {
+            if (sequencesWithDependents_.find(seq) == sequencesWithDependents_.end()) {
+                // This sequence has no dependents - it's a final consumer
+                ringBuffer_.addGatingSequence(*seq);
+            }
+        }
+    }
+
+    /**
+     * Helper for after() - returns a group that uses stored dependencies.
+     */
+    HandlerGroupType& afterGroup() {
+        // Create a temporary group that will be used for the next handleEventsWith call
+        handlerGroups_.emplace_back(
+            std::make_unique<HandlerGroupType>(*this, afterDependencies_));
+        return *handlerGroups_.back();
+    }
+
+    /**
+     * Collect dependencies from multiple groups.
+     */
+    template<typename... Groups>
+    void collectDependencies(std::vector<const Sequence*>& deps, const HandlerGroupType& group, const Groups&... rest) {
+        for (const Sequence* seq : group.getSequences()) {
+            deps.push_back(seq);
+        }
+        if constexpr (sizeof...(rest) > 0) {
+            collectDependencies(deps, rest...);
+        }
+    }
+
     RingBufferType ringBuffer_;
     std::vector<std::unique_ptr<SimpleBarrierType>> barriers_;
     std::vector<std::unique_ptr<BarrierType>> dependencyBarriers_;
     std::vector<std::unique_ptr<ProcessorWrapper>> processors_;
-    std::vector<std::unique_ptr<HandlerChain>> handlerChains_;
+    std::vector<std::unique_ptr<HandlerGroupType>> handlerGroups_;
+    std::vector<const Sequence*> allSequences_;
+    std::set<const Sequence*> sequencesWithDependents_;
+    std::vector<const Sequence*> afterDependencies_;
     std::atomic<bool> started_{false};
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HandlerGroup method implementations
+// ═══════════════════════════════════════════════════════════════════════════
+
+template<typename T, size_t Size, typename WaitStrategy, typename ProducerType>
+template<typename... Handlers>
+HandlerGroup<T, Size, WaitStrategy, ProducerType>&
+HandlerGroup<T, Size, WaitStrategy, ProducerType>::then(Handlers&... handlers) {
+    return disruptor_.createHandlerGroup(sequences_, handlers...);
+}
+
+template<typename T, size_t Size, typename WaitStrategy, typename ProducerType>
+template<typename... Handlers>
+HandlerGroup<T, Size, WaitStrategy, ProducerType>&
+HandlerGroup<T, Size, WaitStrategy, ProducerType>::handleEventsWith(Handlers&... handlers) {
+    return disruptor_.createHandlerGroup(sequences_, handlers...);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONVENIENCE ALIASES
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Single producer disruptor.
- */
 template<typename T, size_t Size, typename WaitStrategy = BusySpinWait>
 using SPDisruptor = Disruptor<T, Size, WaitStrategy, SingleProducerType>;
 
-/**
- * Multi producer disruptor.
- */
 template<typename T, size_t Size, typename WaitStrategy = BusySpinWait>
 using MPDisruptor = Disruptor<T, Size, WaitStrategy, MultiProducerType>;
 

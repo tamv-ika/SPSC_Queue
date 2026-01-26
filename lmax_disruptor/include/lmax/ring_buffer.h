@@ -65,6 +65,7 @@ public:
     using value_type = T;
     using barrier_type = SequenceBarrier<WaitStrategy>;
     using simple_barrier_type = SimpleBarrier<WaitStrategy>;
+    using optimized_barrier_type = OptimizedBarrier<WaitStrategy>;
     using sequencer_type = typename SequencerSelector<ProducerType, Size, WaitStrategy>::type;
     using producer_type = ProducerType;
 
@@ -159,6 +160,14 @@ public:
      */
     barrier_type newBarrier(std::initializer_list<const Sequence*> dependencies) const noexcept {
         return barrier_type(sequencer_.cursor(), dependencies);
+    }
+
+    /**
+     * Create an optimized barrier for diamond patterns with multiple dependencies.
+     * Uses caching and relaxed memory ordering for better performance.
+     */
+    optimized_barrier_type newOptimizedBarrier(std::initializer_list<const Sequence*> dependencies) const noexcept {
+        return optimized_barrier_type(sequencer_.cursor(), dependencies);
     }
 
     /**

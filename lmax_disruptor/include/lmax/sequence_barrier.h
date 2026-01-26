@@ -243,4 +243,103 @@ private:
     std::atomic<bool> alerted_{false};
 };
 
+/**
+ * Optimized barrier for diamond patterns with multiple dependencies.
+ *
+ * Optimizations:
+ * 1. Single combined wait loop (cursor + dependencies)
+ * 2. Cached min sequence to reduce repeated calculations
+ * 3. Relaxed ordering for dependency reads (cursor provides acquire)
+ * 4. Prefetch-friendly sequential access
+ */
+template<typename WaitStrategy = BusySpinWait, size_t MaxDependencies = 8>
+class OptimizedBarrier {
+public:
+    OptimizedBarrier(const Sequence& cursor, std::initializer_list<const Sequence*> deps) noexcept
+        : cursor_(cursor)
+        , dependencyCount_(0)
+        , cachedAvailable_(INITIAL_CURSOR_VALUE)
+    {
+        for (const Sequence* dep : deps) {
+            if (dependencyCount_ < MaxDependencies && dep != nullptr) {
+                dependencies_[dependencyCount_++] = dep;
+            }
+        }
+    }
+
+    /**
+     * Wait for sequence - optimized single loop with caching.
+     */
+    inline __attribute__((always_inline)) int64_t waitFor(int64_t sequence) noexcept {
+        // Fast path: check cached value first
+        if (cachedAvailable_ >= sequence) {
+            return cachedAvailable_;
+        }
+
+        // Slow path: wait for sequence to become available
+        int64_t available;
+        while ((available = getMinAvailable()) < sequence) {
+            if (alerted_.load(std::memory_order_acquire)) {
+                return ALERTED;
+            }
+            wait_.wait();
+        }
+        wait_.reset();
+
+        // Cache the result for next call
+        cachedAvailable_ = available;
+        return available;
+    }
+
+    /**
+     * Non-blocking availability check with caching.
+     */
+    [[nodiscard]] inline __attribute__((always_inline)) int64_t available() noexcept {
+        int64_t avail = getMinAvailable();
+        if (avail > cachedAvailable_) {
+            cachedAvailable_ = avail;
+        }
+        return cachedAvailable_;
+    }
+
+    void alert() noexcept {
+        alerted_.store(true, std::memory_order_release);
+    }
+
+    void clearAlert() noexcept {
+        alerted_.store(false, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool isAlerted() const noexcept {
+        return alerted_.load(std::memory_order_acquire);
+    }
+
+private:
+    /**
+     * Get minimum of cursor and all dependencies.
+     * Uses relaxed ordering for dependencies since cursor provides synchronization.
+     */
+    [[nodiscard]] inline __attribute__((always_inline)) int64_t getMinAvailable() const noexcept {
+        // Start with cursor (acquire ordering for synchronization)
+        int64_t minSeq = cursor_.get();
+
+        // Check dependencies with relaxed ordering (faster)
+        for (size_t i = 0; i < dependencyCount_; ++i) {
+            int64_t depSeq = dependencies_[i]->getRelaxed();
+            if (depSeq < minSeq) {
+                minSeq = depSeq;
+            }
+        }
+
+        return minSeq;
+    }
+
+    const Sequence& cursor_;
+    std::array<const Sequence*, MaxDependencies> dependencies_{};
+    size_t dependencyCount_;
+    int64_t cachedAvailable_;  // Cache last known available sequence
+    WaitStrategy wait_;
+    std::atomic<bool> alerted_{false};
+};
+
 } // namespace lmax
