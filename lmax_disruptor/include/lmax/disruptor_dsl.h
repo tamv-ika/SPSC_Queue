@@ -15,6 +15,7 @@
 #include "ring_buffer.h"
 #include "batch_event_processor.h"
 #include "event_handler.h"
+#include "event_processor.h"
 #include "sequence.h"
 #include "sequence_barrier.h"
 #include <vector>
@@ -55,6 +56,21 @@ public:
     HandlerGroup& then(Handlers&... handlers);
 
     /**
+     * Add custom processor using a factory function.
+     * DSL creates the barrier and passes it to your factory.
+     *
+     * Example:
+     *   disruptor.handleEventsWith(h1)
+     *       .thenFactory([&](auto& ringBuffer, auto& barrier) {
+     *           return std::make_unique<MyProcessor>(ringBuffer, barrier, myCallback);
+     *       });
+     *
+     * Factory signature: std::unique_ptr<IEventProcessor>(RingBuffer&, BarrierType&)
+     */
+    template<typename Factory>
+    HandlerGroup& thenFactory(Factory&& factory);
+
+    /**
      * Add handler(s) that depend on specific handler groups.
      *
      * Example:
@@ -64,6 +80,12 @@ public:
      */
     template<typename... Handlers>
     HandlerGroup& handleEventsWith(Handlers&... handlers);
+
+    /**
+     * Add custom processor using a factory function (with dependencies from this group).
+     */
+    template<typename Factory>
+    HandlerGroup& handleEventsWithFactory(Factory&& factory);
 
     /**
      * Get sequences for all handlers in this group.
@@ -257,54 +279,65 @@ public:
         ringBuffer_.publish(loSeq, hiSeq);
     }
 
-private:
-    friend class HandlerGroup<T, Size, WaitStrategy, ProducerType>;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CUSTOM PROCESSOR SUPPORT
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Type-erased processor wrapper.
+     * Add a custom processor to be managed by the Disruptor.
+     *
+     * The processor must implement IEventProcessor interface.
+     * DSL takes ownership of the processor.
+     *
+     * @param processor Unique pointer to the custom processor
+     * @param isFinalConsumer If true, this processor's sequence will gate the producer
+     *
+     * Example:
+     *   auto barrier = d.getRingBuffer().newBarrier();
+     *   auto customProc = std::make_unique<MyCustomProcessor>(
+     *       d.getRingBuffer(), barrier, ...);
+     *   d.addProcessor(std::move(customProc), true);
      */
-    class ProcessorWrapper {
-    public:
-        ProcessorWrapper(RingBufferType& ringBuffer,
-                        SimpleBarrierType& barrier,
-                        EventHandler<T>& handler)
-            : simpleProcessor_(std::make_unique<
-                BatchEventProcessor<T, RingBufferType, SimpleBarrierType>>(
-                    ringBuffer, barrier, handler))
-        {}
+    void addProcessor(std::unique_ptr<IEventProcessor> processor, bool isFinalConsumer = true) {
+        const Sequence* seq = &processor->getSequence();
+        allSequences_.push_back(seq);
 
-        ProcessorWrapper(RingBufferType& ringBuffer,
-                        BarrierType& barrier,
-                        EventHandler<T>& handler)
-            : depProcessor_(std::make_unique<
-                BatchEventProcessor<T, RingBufferType, BarrierType>>(
-                    ringBuffer, barrier, handler))
-        {}
-
-        void start() {
-            if (simpleProcessor_) simpleProcessor_->start();
-            else if (depProcessor_) depProcessor_->start();
+        if (!isFinalConsumer) {
+            sequencesWithDependents_.insert(seq);
         }
 
-        void halt() {
-            if (simpleProcessor_) simpleProcessor_->halt();
-            else if (depProcessor_) depProcessor_->halt();
+        processors_.push_back(std::move(processor));
+    }
+
+    /**
+     * Add a custom processor with dependencies on other sequences.
+     * Creates a HandlerGroup so you can chain with then().
+     *
+     * @param processor Unique pointer to the custom processor
+     * @param dependencies Sequences this processor depends on
+     */
+    HandlerGroupType& addProcessorAfter(std::unique_ptr<IEventProcessor> processor,
+                                        const std::vector<const Sequence*>& dependencies) {
+        const Sequence* seq = &processor->getSequence();
+
+        std::vector<const Sequence*> sequences;
+        sequences.push_back(seq);
+        allSequences_.push_back(seq);
+
+        // Mark dependencies as having dependents
+        for (const Sequence* dep : dependencies) {
+            sequencesWithDependents_.insert(dep);
         }
 
-        void join() {
-            if (simpleProcessor_) simpleProcessor_->join();
-            else if (depProcessor_) depProcessor_->join();
-        }
+        processors_.push_back(std::move(processor));
 
-        [[nodiscard]] const Sequence& getSequence() const {
-            if (simpleProcessor_) return simpleProcessor_->getSequence();
-            return depProcessor_->getSequence();
-        }
+        handlerGroups_.emplace_back(
+            std::make_unique<HandlerGroupType>(*this, std::move(sequences)));
+        return *handlerGroups_.back();
+    }
 
-    private:
-        std::unique_ptr<BatchEventProcessor<T, RingBufferType, SimpleBarrierType>> simpleProcessor_;
-        std::unique_ptr<BatchEventProcessor<T, RingBufferType, BarrierType>> depProcessor_;
-    };
+private:
+    friend class HandlerGroup<T, Size, WaitStrategy, ProducerType>;
 
     /**
      * Create handler group with dependencies.
@@ -359,8 +392,9 @@ private:
                         std::vector<const Sequence*>& outSequences) {
         if (dependencies.empty()) {
             auto barrier = std::make_unique<SimpleBarrierType>(ringBuffer_.cursor());
-            auto processor = std::make_unique<ProcessorWrapper>(
-                ringBuffer_, *barrier, handler);
+            auto processor = std::make_unique<
+                BatchEventProcessor<T, RingBufferType, SimpleBarrierType>>(
+                    ringBuffer_, *barrier, handler);
 
             const Sequence* seq = &processor->getSequence();
             outSequences.push_back(seq);
@@ -376,8 +410,9 @@ private:
                 sequencesWithDependents_.insert(dep);
             }
 
-            auto processor = std::make_unique<ProcessorWrapper>(
-                ringBuffer_, *barrier, handler);
+            auto processor = std::make_unique<
+                BatchEventProcessor<T, RingBufferType, BarrierType>>(
+                    ringBuffer_, *barrier, handler);
 
             const Sequence* seq = &processor->getSequence();
             outSequences.push_back(seq);
@@ -426,7 +461,7 @@ private:
     RingBufferType ringBuffer_;
     std::vector<std::unique_ptr<SimpleBarrierType>> barriers_;
     std::vector<std::unique_ptr<BarrierType>> dependencyBarriers_;
-    std::vector<std::unique_ptr<ProcessorWrapper>> processors_;
+    std::vector<std::unique_ptr<IEventProcessor>> processors_;
     std::vector<std::unique_ptr<HandlerGroupType>> handlerGroups_;
     std::vector<const Sequence*> allSequences_;
     std::set<const Sequence*> sequencesWithDependents_;

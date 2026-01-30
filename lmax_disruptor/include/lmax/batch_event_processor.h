@@ -15,6 +15,7 @@
 #include "sequence.h"
 #include "sequence_barrier.h"
 #include "event_handler.h"
+#include "event_processor.h"
 #include <atomic>
 #include <thread>
 #include <memory>
@@ -50,7 +51,7 @@ enum class ProcessorState {
  *   processor.halt();
  */
 template<typename T, typename RingBufferType, typename BarrierType>
-class BatchEventProcessor {
+class BatchEventProcessor : public IEventProcessor {
 public:
     /**
      * Construct a batch event processor.
@@ -83,7 +84,7 @@ public:
      * Get the sequence maintained by this processor.
      * This represents the last successfully processed event.
      */
-    [[nodiscard]] const Sequence& getSequence() const noexcept {
+    [[nodiscard]] const Sequence& getSequence() const noexcept override {
         return sequence_;
     }
 
@@ -97,7 +98,7 @@ public:
     /**
      * Check if the processor is running.
      */
-    [[nodiscard]] bool isRunning() const noexcept {
+    [[nodiscard]] bool isRunning() const noexcept override {
         return state_.load(std::memory_order_acquire) == ProcessorState::RUNNING;
     }
 
@@ -105,7 +106,7 @@ public:
      * Start the processor in a new thread.
      * Throws if already running.
      */
-    void start() {
+    void start() override {
         ProcessorState expected = ProcessorState::IDLE;
         if (!state_.compare_exchange_strong(expected, ProcessorState::RUNNING,
                                            std::memory_order_acq_rel)) {
@@ -124,7 +125,7 @@ public:
      * Request the processor to halt after completing current batch.
      * Alerts the barrier to interrupt any blocking waitFor() call.
      */
-    void halt() noexcept {
+    void halt() noexcept override {
         ProcessorState expected = ProcessorState::RUNNING;
         if (state_.compare_exchange_strong(expected, ProcessorState::HALTING,
                                           std::memory_order_acq_rel)) {
@@ -136,7 +137,7 @@ public:
     /**
      * Wait for the processor to stop.
      */
-    void join() {
+    void join() override {
         if (thread_.joinable()) {
             thread_.join();
         }
