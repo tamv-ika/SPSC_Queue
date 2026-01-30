@@ -1,0 +1,8 @@
+# Test executables (by naming pattern)
+*_test
+*_benchmark
+
+# Build artifacts
+*.o
+*.out
+*.exe
