@@ -59,6 +59,70 @@ public:
     }
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// NOEXCEPT EVENT HANDLER (Zero-exception hot path)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Result of processing an event in noexcept handler.
+ */
+enum class ProcessResult : uint8_t {
+    OK,      // Success, continue processing
+    SKIP,    // Skip this event, continue with next
+    RETRY,   // Retry this event (processor may back off)
+    STOP     // Stop the processor gracefully
+};
+
+/**
+ * NoExcept event handler interface - for zero-exception hot paths.
+ *
+ * All methods are noexcept. Errors are returned via ProcessResult.
+ * Use this for maximum performance in latency-critical code.
+ *
+ * Example:
+ *   class MyHandler : public NoExceptEventHandler<Event> {
+ *       ProcessResult onEvent(Event& e, int64_t seq, bool eob) noexcept override {
+ *           if (!validate(e)) return ProcessResult::SKIP;
+ *           process(e);
+ *           return ProcessResult::OK;
+ *       }
+ *   };
+ */
+template<typename T>
+class NoExceptEventHandler {
+public:
+    virtual ~NoExceptEventHandler() = default;
+
+    /**
+     * Process an event. Must be noexcept.
+     *
+     * @return ProcessResult indicating how to proceed
+     */
+    virtual ProcessResult onEvent(T& event, int64_t sequence, bool endOfBatch) noexcept = 0;
+
+    virtual void onStart() noexcept {}
+    virtual void onShutdown() noexcept {}
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TYPE TRAITS FOR HANDLER DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace detail {
+
+template<typename T, typename Handler, typename = void>
+struct is_noexcept_handler : std::false_type {};
+
+template<typename T, typename Handler>
+struct is_noexcept_handler<T, Handler,
+    std::enable_if_t<std::is_base_of_v<NoExceptEventHandler<T>, Handler>>>
+    : std::true_type {};
+
+template<typename T, typename Handler>
+inline constexpr bool is_noexcept_handler_v = is_noexcept_handler<T, Handler>::value;
+
+} // namespace detail
+
 /**
  * Functional event handler - wraps a lambda/function for convenience.
  *

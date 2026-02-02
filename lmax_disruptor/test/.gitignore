@@ -1,6 +1,7 @@
 # Test executables (by naming pattern)
 *_test
 *_benchmark
+*_example
 
 # Build artifacts
 *.o

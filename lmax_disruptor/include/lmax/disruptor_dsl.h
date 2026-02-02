@@ -385,7 +385,7 @@ private:
     }
 
     /**
-     * Create a single processor.
+     * Create a single processor for EventHandler (with exceptions).
      */
     void createProcessor(EventHandler<T>& handler,
                         const std::vector<const Sequence*>& dependencies,
@@ -406,12 +406,49 @@ private:
             auto barrier = std::make_unique<BarrierType>(ringBuffer_.cursor());
             for (const Sequence* dep : dependencies) {
                 barrier->addDependency(*dep);
-                // Track that 'dep' has a dependent
                 sequencesWithDependents_.insert(dep);
             }
 
             auto processor = std::make_unique<
                 BatchEventProcessor<T, RingBufferType, BarrierType>>(
+                    ringBuffer_, *barrier, handler);
+
+            const Sequence* seq = &processor->getSequence();
+            outSequences.push_back(seq);
+            allSequences_.push_back(seq);
+
+            dependencyBarriers_.push_back(std::move(barrier));
+            processors_.push_back(std::move(processor));
+        }
+    }
+
+    /**
+     * Create a single processor for NoExceptEventHandler (zero-exception).
+     */
+    void createProcessor(NoExceptEventHandler<T>& handler,
+                        const std::vector<const Sequence*>& dependencies,
+                        std::vector<const Sequence*>& outSequences) {
+        if (dependencies.empty()) {
+            auto barrier = std::make_unique<SimpleBarrierType>(ringBuffer_.cursor());
+            auto processor = std::make_unique<
+                NoExceptBatchEventProcessor<T, RingBufferType, SimpleBarrierType>>(
+                    ringBuffer_, *barrier, handler);
+
+            const Sequence* seq = &processor->getSequence();
+            outSequences.push_back(seq);
+            allSequences_.push_back(seq);
+
+            barriers_.push_back(std::move(barrier));
+            processors_.push_back(std::move(processor));
+        } else {
+            auto barrier = std::make_unique<BarrierType>(ringBuffer_.cursor());
+            for (const Sequence* dep : dependencies) {
+                barrier->addDependency(*dep);
+                sequencesWithDependents_.insert(dep);
+            }
+
+            auto processor = std::make_unique<
+                NoExceptBatchEventProcessor<T, RingBufferType, BarrierType>>(
                     ringBuffer_, *barrier, handler);
 
             const Sequence* seq = &processor->getSequence();

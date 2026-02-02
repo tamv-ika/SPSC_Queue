@@ -201,6 +201,133 @@ auto makeBatchProcessor(RingBufferType& ringBuffer,
     return BatchEventProcessor<T, RingBufferType, BarrierType>(ringBuffer, barrier, handler);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// NOEXCEPT BATCH EVENT PROCESSOR (Zero-exception hot path)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * NoExceptBatchEventProcessor - Zero-exception event processor.
+ *
+ * Same as BatchEventProcessor but:
+ * - Works with NoExceptEventHandler (noexcept onEvent)
+ * - No try-catch in hot path
+ * - Uses ProcessResult for flow control
+ * - Entire run loop is noexcept
+ *
+ * Use this for maximum performance when you can guarantee no exceptions.
+ */
+template<typename T, typename RingBufferType, typename BarrierType>
+class NoExceptBatchEventProcessor : public IEventProcessor {
+public:
+    NoExceptBatchEventProcessor(RingBufferType& ringBuffer,
+                                BarrierType& barrier,
+                                NoExceptEventHandler<T>& handler) noexcept
+        : ringBuffer_(ringBuffer)
+        , barrier_(barrier)
+        , handler_(handler)
+        , state_(ProcessorState::IDLE)
+    {}
+
+    NoExceptBatchEventProcessor(const NoExceptBatchEventProcessor&) = delete;
+    NoExceptBatchEventProcessor& operator=(const NoExceptBatchEventProcessor&) = delete;
+
+    ~NoExceptBatchEventProcessor() {
+        halt();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    [[nodiscard]] const Sequence& getSequence() const noexcept override {
+        return sequence_;
+    }
+
+    [[nodiscard]] ProcessorState getState() const noexcept {
+        return state_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool isRunning() const noexcept override {
+        return state_.load(std::memory_order_acquire) == ProcessorState::RUNNING;
+    }
+
+    void start() override {
+        ProcessorState expected = ProcessorState::IDLE;
+        if (!state_.compare_exchange_strong(expected, ProcessorState::RUNNING,
+                                           std::memory_order_acq_rel)) {
+            if (expected == ProcessorState::RUNNING) {
+                throw std::runtime_error("Processor is already running");
+            }
+            if (expected == ProcessorState::HALTING) {
+                throw std::runtime_error("Processor is shutting down");
+            }
+        }
+        thread_ = std::thread([this]() noexcept { run(); });
+    }
+
+    void halt() noexcept override {
+        ProcessorState expected = ProcessorState::RUNNING;
+        if (state_.compare_exchange_strong(expected, ProcessorState::HALTING,
+                                          std::memory_order_acq_rel)) {
+            barrier_.alert();
+        }
+    }
+
+    void join() override {
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    /**
+     * Run the processor - entirely noexcept.
+     */
+    void run() noexcept {
+        handler_.onStart();
+
+        int64_t nextSequence = sequence_.get() + 1;
+
+        while (state_.load(std::memory_order_acquire) == ProcessorState::RUNNING) {
+            int64_t availableSequence = barrier_.waitFor(nextSequence);
+
+            if (availableSequence == ALERTED) {
+                break;
+            }
+
+            while (nextSequence <= availableSequence) {
+                T* event = const_cast<T*>(ringBuffer_.get(nextSequence));
+                bool endOfBatch = (nextSequence == availableSequence);
+
+                // No try-catch - handler is noexcept
+                ProcessResult result = handler_.onEvent(*event, nextSequence, endOfBatch);
+
+                if (result == ProcessResult::STOP) {
+                    state_.store(ProcessorState::HALTING, std::memory_order_release);
+                    goto exit_loop;
+                }
+                // TODO: Implement RETRY with max retry count
+                // SKIP - just continue to next event (current behavior)
+
+                ++nextSequence;
+            }
+
+            sequence_.set(availableSequence);
+        }
+
+    exit_loop:
+        state_.store(ProcessorState::HALTED, std::memory_order_release);
+        handler_.onShutdown();
+    }
+
+private:
+    RingBufferType& ringBuffer_;
+    BarrierType& barrier_;
+    NoExceptEventHandler<T>& handler_;
+
+    alignas(64) Sequence sequence_;
+    std::atomic<ProcessorState> state_;
+    std::thread thread_;
+};
+
 /**
  * NoOpEventProcessor - A processor that does nothing.
  * Useful for testing or as a placeholder.
