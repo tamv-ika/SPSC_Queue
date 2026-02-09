@@ -18,12 +18,18 @@
 #include <memory>
 #include <emmintrin.h>
 #include "../include/lmax/disruptor.h"
+#include <pthread.h>
 
 // RDTSC for precise timing
 inline uint64_t rdtscp() {
     uint32_t lo, hi;
     __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi) : : "rcx", "memory");
     return (uint64_t(hi) << 32) | lo;
+}
+
+void pinCPU(int cpu) {
+    cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
 inline void spinWait(uint64_t cycles) {
@@ -731,6 +737,655 @@ bool testDiamondOptimizedLatency() {
     return true;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 12: 3-Way Parallel Diamond Throughput
+// Pattern: (h1, h2, h3) -> h4
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool test3WayDiamondThroughput() {
+    std::cout << "\n=== Test: 3-Way Diamond Throughput ===\n";
+    std::cout << "  Pattern: (h1, h2, h3) -> h4\n";
+
+    constexpr size_t NUM_EVENTS = 1000000;
+
+    lmax::Disruptor<TestEvent, 65536, lmax::BusySpinWait> disruptor;
+
+    SimpleHandler h1, h2, h3, h4;
+
+    // 3 handlers in parallel, then h4 waits for all
+    auto& g1 = disruptor.handleEventsWith(h1);
+    auto& g2 = disruptor.handleEventsWith(h2);
+    auto& g3 = disruptor.handleEventsWith(h3);
+    disruptor.after(g1, g2, g3).handleEventsWith(h4);
+
+    disruptor.start();
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < NUM_EVENTS; i++) {
+        disruptor.publishEvent([i](TestEvent& e, int64_t seq) {
+            e.value = i;
+        });
+    }
+
+    while (h4.count.load() < NUM_EVENTS) {
+        std::this_thread::yield();
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    double seconds = std::chrono::duration<double>(end - start).count();
+    double mops = NUM_EVENTS / seconds / 1e6;
+
+    disruptor.shutdown();
+
+    std::cout << "  Events: " << NUM_EVENTS << "\n";
+    std::cout << "  h1: " << h1.count.load() << ", h2: " << h2.count.load()
+              << ", h3: " << h3.count.load() << ", h4: " << h4.count.load() << "\n";
+    std::cout << "  Throughput: " << std::fixed << std::setprecision(2) << mops << " M ops/sec\n";
+    std::cout << "Result: PASSED\n";
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 13: 3-Way Parallel Diamond Latency
+// Pattern: (h1, h2, h3) -> h4
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool test3WayDiamondLatency() {
+    std::cout << "\n=== Test: 3-Way Diamond Latency ===\n";
+    std::cout << "  Pattern: (h1, h2, h3) -> h4\n";
+
+    constexpr size_t NUM_EVENTS = 100000;
+    constexpr uint64_t THROTTLE_CYCLES = 1000;
+    constexpr double CPU_GHZ = 2.9;
+
+    lmax::Disruptor<TestEvent, 65536, lmax::BusySpinWait> disruptor;
+
+    SimpleHandler h1, h2, h3;
+    std::unique_ptr<uint64_t[]> latencies(new uint64_t[NUM_EVENTS]);
+    LatencyHandler h4(latencies.get(), NUM_EVENTS);
+
+    // 3 handlers in parallel, then h4 waits for all
+    auto& g1 = disruptor.handleEventsWith(h1);
+    auto& g2 = disruptor.handleEventsWith(h2);
+    auto& g3 = disruptor.handleEventsWith(h3);
+    disruptor.after(g1, g2, g3).handleEventsWith(h4);
+
+    disruptor.start();
+
+    // Wait for handlers to start
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    for (size_t i = 0; i < NUM_EVENTS; i++) {
+        spinWait(THROTTLE_CYCLES);
+
+        disruptor.publishEvent([i](TestEvent& e, int64_t seq) {
+            e.value = i;
+            e.timestamp = rdtscp();
+        });
+    }
+
+    while (h4.count.load() < NUM_EVENTS) {
+        std::this_thread::yield();
+    }
+
+    disruptor.shutdown();
+
+    LatencyStats stats;
+    stats.calculate(latencies.get(), h4.count.load());
+    stats.print(CPU_GHZ);
+
+    std::cout << "Result: PASSED\n";
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 14: 3-Way Diamond with Raw SequenceBarrier - Throughput (Fair comparison)
+// Pattern: (h1, h2, h3) -> h4
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool test3WayDiamondRawThroughput() {
+    std::cout << "\n=== Test: 3-Way Diamond Raw Throughput ===\n";
+    std::cout << "  Pattern: (h1, h2, h3) -> h4 (SequenceBarrier, raw threads)\n";
+
+    constexpr size_t NUM_EVENTS = 1000000;
+    constexpr size_t BUFFER_SIZE = 65536;
+
+    using RingBufferType = lmax::RingBuffer<TestEvent, BUFFER_SIZE, lmax::BusySpinWait>;
+    RingBufferType ring;
+
+    lmax::Sequence h1Seq, h2Seq, h3Seq, h4Seq;
+
+    // h1, h2, h3 wait on cursor (parallel) - using SimpleBarrier
+    auto h1Barrier = ring.newBarrier();
+    auto h2Barrier = ring.newBarrier();
+    auto h3Barrier = ring.newBarrier();
+
+    // h4 uses standard SequenceBarrier with 3 dependencies
+    auto h4Barrier = ring.newBarrier({&h1Seq, &h2Seq, &h3Seq});
+
+    ring.addGatingSequence(h4Seq);
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> t1Done{false}, t2Done{false}, t3Done{false}, t4Done{false};
+    std::atomic<size_t> h4Count{0};
+
+    pinCPU(4);
+    std::thread t1([&]() {
+        pinCPU(0);
+        t1Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h1Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h1Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t2([&]() {
+        pinCPU(1);
+        t2Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h2Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h2Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t3([&]() {
+        pinCPU(2);
+        t3Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h3Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h3Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t4([&]() {
+        pinCPU(3);
+        t4Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) ||
+               next <= h1Seq.get() || next <= h2Seq.get() || next <= h3Seq.get()) {
+            int64_t avail = h4Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h4Seq.set(next);
+                h4Count.fetch_add(1, std::memory_order_relaxed);
+                next++;
+            }
+        }
+    });
+
+    while (!(t1Done.load(std::memory_order_relaxed) 
+    && t2Done.load(std::memory_order_relaxed) 
+    && t3Done.load(std::memory_order_relaxed) 
+    && t4Done.load(std::memory_order_relaxed)))
+    {
+        /* code */
+    }
+    
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < NUM_EVENTS; i++) {
+        int64_t seq = ring.next();
+        TestEvent* e = ring.get(seq);
+        e->value = i;
+        ring.publish(seq);
+    }
+
+    while (h4Count.load() < NUM_EVENTS) {
+        std::this_thread::yield();
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    done.store(true);
+    h1Barrier.alert();
+    h2Barrier.alert();
+    h3Barrier.alert();
+    h4Barrier.alert();
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    double seconds = std::chrono::duration<double>(end - start).count();
+    double mops = NUM_EVENTS / seconds / 1e6;
+
+    std::cout << "  Throughput: " << std::fixed << std::setprecision(2) << mops << " M ops/sec\n";
+    std::cout << "Result: PASSED\n";
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 15: 3-Way Diamond with Raw SequenceBarrier - Latency (Fair comparison)
+// Pattern: (h1, h2, h3) -> h4
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool test3WayDiamondRawLatency() {
+    std::cout << "\n=== Test: 3-Way Diamond Raw Latency ===\n";
+    std::cout << "  Pattern: (h1, h2, h3) -> h4 (SequenceBarrier, raw threads)\n";
+
+    constexpr size_t NUM_EVENTS = 100000;
+    constexpr size_t BUFFER_SIZE = 65536;
+    constexpr uint64_t THROTTLE_CYCLES = 1000;
+    constexpr double CPU_GHZ = 2.9;
+
+    using RingBufferType = lmax::RingBuffer<TestEvent, BUFFER_SIZE, lmax::BusySpinWait>;
+    RingBufferType ring;
+
+    lmax::Sequence h1Seq, h2Seq, h3Seq, h4Seq;
+
+    auto h1Barrier = ring.newBarrier();
+    auto h2Barrier = ring.newBarrier();
+    auto h3Barrier = ring.newBarrier();
+    auto h4Barrier = ring.newBarrier({&h1Seq, &h2Seq, &h3Seq});
+
+    ring.addGatingSequence(h4Seq);
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> t1Done{false}, t2Done{false}, t3Done{false}, t4Done{false};
+
+    std::unique_ptr<uint64_t[]> latencies(new uint64_t[NUM_EVENTS]);
+    std::atomic<size_t> h4Count{0};
+
+    pinCPU(4);
+    std::thread t1([&]() {
+        pinCPU(0);
+        t1Done.store(true);
+
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h1Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h1Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t2([&]() {
+        pinCPU(1);
+        t2Done.store(true);
+
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h2Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h2Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t3([&]() {
+        pinCPU(2);
+        t3Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h3Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h3Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t4([&]() {
+        pinCPU(3);
+        t4Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) ||
+               next <= h1Seq.get() || next <= h2Seq.get() || next <= h3Seq.get()) {
+            int64_t avail = h4Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                const TestEvent* e = ring.get(next);
+                size_t idx = h4Count.load(std::memory_order_relaxed);
+                if (idx < NUM_EVENTS) {
+                    latencies[idx] = rdtscp() - e->timestamp;
+                }
+                h4Seq.set(next);
+                h4Count.fetch_add(1, std::memory_order_relaxed);
+                next++;
+            }
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    while (!(t1Done.load(std::memory_order_relaxed) 
+    && t2Done.load(std::memory_order_relaxed) 
+    && t3Done.load(std::memory_order_relaxed) 
+    && t4Done.load(std::memory_order_relaxed)))
+    {
+        /* code */
+    }
+
+    for (size_t i = 0; i < NUM_EVENTS; i++) {
+        spinWait(THROTTLE_CYCLES);
+
+        int64_t seq = ring.next();
+        TestEvent* e = ring.get(seq);
+        e->value = i;
+        std::atomic_thread_fence(std::memory_order_release);
+        e->timestamp = rdtscp();
+        ring.publish(seq);
+    }
+
+    while (h4Count.load() < NUM_EVENTS) {
+        std::this_thread::yield();
+    }
+
+    done.store(true);
+    h1Barrier.alert();
+    h2Barrier.alert();
+    h3Barrier.alert();
+    h4Barrier.alert();
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    LatencyStats stats;
+    stats.calculate(latencies.get(), h4Count.load());
+    stats.print(CPU_GHZ);
+
+    std::cout << "Result: PASSED\n";
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 16: 3-Way Diamond with OptimizedBarrier - Throughput
+// Pattern: (h1, h2, h3) -> h4
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool test3WayDiamondOptimizedThroughput() {
+    std::cout << "\n=== Test: 3-Way Diamond Optimized Throughput ===\n";
+    std::cout << "  Pattern: (h1, h2, h3) -> h4 (OptimizedBarrier)\n";
+
+    constexpr size_t NUM_EVENTS = 1000000;
+    constexpr size_t BUFFER_SIZE = 65536;
+
+    using RingBufferType = lmax::RingBuffer<TestEvent, BUFFER_SIZE, lmax::BusySpinWait>;
+    RingBufferType ring;
+
+    lmax::Sequence h1Seq, h2Seq, h3Seq, h4Seq;
+
+    // h1, h2, h3 wait on cursor (parallel)
+    auto h1Barrier = ring.newBarrier();
+    auto h2Barrier = ring.newBarrier();
+    auto h3Barrier = ring.newBarrier();
+
+    // h4 uses OptimizedBarrier to wait on all 3
+    auto h4Barrier = ring.newOptimizedBarrier({&h1Seq, &h2Seq, &h3Seq});
+
+    ring.addGatingSequence(h4Seq);
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> t1Done{false}, t2Done{false}, t3Done{false}, t4Done{false};
+
+    std::atomic<size_t> h4Count{0};
+
+    pinCPU(4);
+    // h1 consumer
+    std::thread t1([&]() {
+        pinCPU(0);
+        t1Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h1Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h1Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    // h2 consumer
+    std::thread t2([&]() {
+        pinCPU(1);
+        t2Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h2Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h2Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    // h3 consumer
+    std::thread t3([&]() {
+        pinCPU(2);
+        t3Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h3Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h3Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    // h4 consumer (uses optimized barrier)
+    std::thread t4([&]() {
+        pinCPU(3);
+        t4Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) ||
+               next <= h1Seq.get() || next <= h2Seq.get() || next <= h3Seq.get()) {
+            int64_t avail = h4Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h4Seq.set(next);
+                h4Count.fetch_add(1, std::memory_order_relaxed);
+                next++;
+            }
+        }
+    });
+
+    while (!(t1Done.load(std::memory_order_relaxed) 
+    && t2Done.load(std::memory_order_relaxed) 
+    && t3Done.load(std::memory_order_relaxed) 
+    && t4Done.load(std::memory_order_relaxed)))
+    {
+        /* code */
+    }
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < NUM_EVENTS; i++) {
+        int64_t seq = ring.next();
+        TestEvent* e = ring.get(seq);
+        e->value = i;
+        ring.publish(seq);
+    }
+
+    while (h4Count.load() < NUM_EVENTS) {
+        std::this_thread::yield();
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    done.store(true);
+    h1Barrier.alert();
+    h2Barrier.alert();
+    h3Barrier.alert();
+    h4Barrier.alert();
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    double seconds = std::chrono::duration<double>(end - start).count();
+    double mops = NUM_EVENTS / seconds / 1e6;
+
+    std::cout << "  Throughput: " << std::fixed << std::setprecision(2) << mops << " M ops/sec\n";
+    std::cout << "Result: PASSED\n";
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 17: 3-Way Diamond with OptimizedBarrier - Latency
+// Pattern: (h1, h2, h3) -> h4
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool test3WayDiamondOptimizedLatency() {
+    std::cout << "\n=== Test: 3-Way Diamond Optimized Latency ===\n";
+    std::cout << "  Pattern: (h1, h2, h3) -> h4 (OptimizedBarrier)\n";
+
+    constexpr size_t NUM_EVENTS = 100000;
+    constexpr size_t BUFFER_SIZE = 65536;
+    constexpr uint64_t THROTTLE_CYCLES = 1000;
+    constexpr double CPU_GHZ = 2.9;
+
+    using RingBufferType = lmax::RingBuffer<TestEvent, BUFFER_SIZE, lmax::BusySpinWait>;
+    RingBufferType ring;
+
+    lmax::Sequence h1Seq, h2Seq, h3Seq, h4Seq;
+
+    auto h1Barrier = ring.newBarrier();
+    auto h2Barrier = ring.newBarrier();
+    auto h3Barrier = ring.newBarrier();
+    auto h4Barrier = ring.newOptimizedBarrier({&h1Seq, &h2Seq, &h3Seq});
+
+    ring.addGatingSequence(h4Seq);
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> t1Done{false}, t2Done{false}, t3Done{false}, t4Done{false};
+
+    std::unique_ptr<uint64_t[]> latencies(new uint64_t[NUM_EVENTS]);
+    std::atomic<size_t> h4Count{0};
+
+    pinCPU(4);
+    std::thread t1([&]() {
+        pinCPU(0);
+        t1Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h1Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h1Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t2([&]() {
+        pinCPU(1);
+        t2Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h2Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h2Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t3([&]() {
+        pinCPU(2);
+        t3Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) || next <= ring.getCursor()) {
+            int64_t avail = h3Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                h3Seq.set(next);
+                next++;
+            }
+        }
+    });
+
+    std::thread t4([&]() {
+        pinCPU(3);
+        t4Done.store(true);
+        int64_t next = 0;
+        while (!done.load(std::memory_order_relaxed) ||
+               next <= h1Seq.get() || next <= h2Seq.get() || next <= h3Seq.get()) {
+            int64_t avail = h4Barrier.waitFor(next);
+            if (avail == lmax::ALERTED) break;
+            while (next <= avail) {
+                const TestEvent* e = ring.get(next);
+                size_t idx = h4Count.load(std::memory_order_relaxed);
+                if (idx < NUM_EVENTS) {
+                    latencies[idx] = rdtscp() - e->timestamp;
+                }
+                h4Seq.set(next);
+                h4Count.fetch_add(1, std::memory_order_relaxed);
+                next++;
+            }
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    while (!(t1Done.load(std::memory_order_relaxed) 
+    && t2Done.load(std::memory_order_relaxed) 
+    && t3Done.load(std::memory_order_relaxed) 
+    && t4Done.load(std::memory_order_relaxed)))
+    {
+        /* code */
+    }
+    for (size_t i = 0; i < NUM_EVENTS; i++) {
+        spinWait(THROTTLE_CYCLES);
+
+        int64_t seq = ring.next();
+        TestEvent* e = ring.get(seq);
+        e->value = i;
+        std::atomic_thread_fence(std::memory_order_release);
+        e->timestamp = rdtscp();
+        ring.publish(seq);
+    }
+
+    while (h4Count.load() < NUM_EVENTS) {
+        std::this_thread::yield();
+    }
+
+    done.store(true);
+    h1Barrier.alert();
+    h2Barrier.alert();
+    h3Barrier.alert();
+    h4Barrier.alert();
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    LatencyStats stats;
+    stats.calculate(latencies.get(), h4Count.load());
+    stats.print(CPU_GHZ);
+
+    std::cout << "Result: PASSED\n";
+    return true;
+}
+
 int main() {
     std::cout << "═══════════════════════════════════════════════════════════════════\n";
     std::cout << "                    Disruptor DSL Tests\n";
@@ -750,6 +1405,12 @@ int main() {
     if (testPipelineLatency()) passed++; else failed++;
     if (testDiamondOptimizedThroughput()) passed++; else failed++;
     if (testDiamondOptimizedLatency()) passed++; else failed++;
+    if (test3WayDiamondThroughput()) passed++; else failed++;
+    if (test3WayDiamondLatency()) passed++; else failed++;
+    if (test3WayDiamondRawThroughput()) passed++; else failed++;
+    if (test3WayDiamondRawLatency()) passed++; else failed++;
+    if (test3WayDiamondOptimizedThroughput()) passed++; else failed++;
+    if (test3WayDiamondOptimizedLatency()) passed++; else failed++;
 
     std::cout << "\n═══════════════════════════════════════════════════════════════════\n";
     std::cout << "Results: " << passed << " passed, " << failed << " failed\n";
